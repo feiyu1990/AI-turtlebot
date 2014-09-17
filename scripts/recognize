@@ -1,0 +1,397 @@
+#!/usr/bin/env python
+
+import roslib
+roslib.load_manifest('sensor_msgs')
+#roslib.load_manifest('store_stereo_image')
+import rospy
+import caffe
+import numpy as np
+import cv2
+import sys
+from App import App
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import PointCloud2, PointField
+import sensor_msgs.point_cloud2 as pc2
+import sensor_msgs
+from sensor_msgs.msg import Image as Imgmsg
+import struct
+import math
+from rospy.numpy_msg import numpy_msg
+from cv_bridge import CvBridge, CvBridgeError
+from sklearn import linear_model, cluster, svm
+import skimage.io
+import cPickle
+from Tkinter import *
+from PIL import Image, ImageTk
+import struct 
+
+##install these
+#import speech_recognition as sr
+from pybrain.datasets            import ClassificationDataSet, SupervisedDataSet
+from pybrain.utilities           import percentError
+from pybrain.tools.shortcuts     import buildNetwork
+from pybrain.supervised.trainers import BackpropTrainer
+from pybrain.structure.modules   import SoftmaxLayer
+
+import select, termios, tty, ImageFile, os.path, time
+
+
+class Recognizer:
+	def __init__(self, app):
+		self.objectfound =False
+		self.a = True
+		self.color_or_depth = True
+		self.app = app
+		self.testimg = np.zeros((480,640))
+		self.now = 0
+		self.rate = 5
+		self.depth_now=0
+		self.points = []
+		self.bg = []
+		self.trainbg = 0
+		self.objectpoints = []
+		self.MAXNUMCLASSES = 100
+		self.onyourown = False
+		self.objectmask = np.zeros((480,640))
+		self.picstobetaken = 0
+		self.takingpics = False
+		self.dist = 0
+		self.objectmaskbefore = 0
+		self.top = 40
+		self.bottom = 320
+		self.left = 120
+		self.right = 520
+		self.FRAMEMASK = np.zeros((480,640)); self.FRAMEMASK[self.top:self.bottom,self.left:self.right] = 1
+		self.starttime = 0
+		self.stoptime = 0
+		self.disttoobj = 0
+		self.picsonrotation = 5
+		self.forward = False
+		self.back = False
+		self.stop = False
+		self.currspeed = 0
+		self.time = 0
+		self.probavgs = []
+		#change directory to caffe
+        	caffe_root = os.environ['HOME']+"/caffe/"
+		self.resourcespath = os.environ['HOME']+"/rgbdslam_catkin_ws/src/recognize/resources/"
+		caffe_dir = os.environ['HOME']+"/caffe/examples"
+		os.chdir(caffe_dir)
+		
+		#classes
+		if os.path.isfile(self.resourcespath + "CLASSES.pkl"):
+			self.classes = cPickle.load(open(self.resourcespath + "CLASSES.pkl", 'rb'))
+		else:		
+			self.classes = ["cat", "eight ball", "bottle", "cube"]
+		#self.classes = []
+		#setup classifier
+		MODEL_FILE = 'imagenet/imagenet_deploy.prototxt'
+       	 	PRETRAINED = 'imagenet/caffe_reference_imagenet_model'
+		self.net = caffe.Classifier(MODEL_FILE, PRETRAINED, mean_file=caffe_root + 'python/caffe/imagenet/ilsvrc_2012_mean.npy', channel_swap=(2,1,0), input_scale=255)
+
+        	self.net.set_phase_test()
+        	self.net.set_mode_gpu()
+
+
+		self.NUMFEATURES = len(self.net.blobs['fc7'].data[4])
+
+       		#svm
+		self.svm = svm.SVC(probability=True)
+		self.newoldclassifier = svm.SVC(probability=True)
+		self.newolddata = [[[0], 1],[[1000], 0]]
+		x,y = zip(*self.newolddata)
+		self.newoldclassifier.fit(x,y)
+		self.combineddata = []
+		if os.path.isfile(self.resourcespath + "TRAINDATA.pkl"):
+			self.moredata = cPickle.load(open(self.resourcespath + "TRAINDATA.pkl", 'rb'))
+			self.combineddata = self.moredata
+		else:		
+			self.data = cPickle.load(open(self.resourcespath + "DATA.pkl", 'rb'))
+			for noun in self.data:
+				self.combineddata += noun
+		X,Y = zip(*self.combineddata)	
+		self.svm.fit(X,Y)
+		
+		if os.path.isfile(self.resourcespath + "NEWOLDDATA.pkl"):
+			self.moredata = cPickle.load(open(self.resourcespath + "NEWOLDDATA.pkl", 'rb'))
+			x = zip(*self.moredata)[0]
+			y = zip(*self.moredata)[1]
+		else:
+			x,y = [],[]
+			for e in X:
+				probs = self.svm.predict_proba(e)[0]
+				x.append([max(probs)-(sum(probs)-max(probs))/(len(probs)-1)])
+				y.append(0)
+			x.append([0])
+			y.append(1)
+		self.newoldclassifier.fit(x,y)
+
+		#print "\n\n\n----------TESTING--------\n\n\n"
+		#test()
+		
+		self.bridge = CvBridge()		
+		rospy.init_node('turtlebot_image')
+        	#self.pub = rospy.Publisher('~cmd_vel', Twist)
+		#self.sub1 = rospy.Subscriber("/camera/depth/image_raw", Imgmsg, self.test_registered1)
+		self.sub1 = rospy.Subscriber("/camera/depth_registered/image_raw", Imgmsg, self.test_registered1)
+		self.sub2 = rospy.Subscriber("camera/rgb/image_color", Imgmsg, self.predict)
+		self.pub = rospy.Publisher('~cmd_vel', Twist)
+		self.r = rospy.Rate(10)
+		self.twist = Twist()
+		#rospy.Rate(4)
+		root.mainloop()
+		rospy.spin()
+
+        def test_registered1(self, points):
+		if self.color_or_depth:
+			if self.depth_now % self.rate ==0:
+				#print "depth"
+				pointsarr = np.fromstring(points.data, dtype=np.uint16)
+				a = pointsarr.reshape((480,640)).astype(float)
+				test = a
+				boolarr = test.astype(int) == 0
+				boolarr = boolarr.astype(int)*1000
+				test += boolarr
+				boolarr = test <= 900
+				test = boolarr.astype(float)
+				test1 = cv2.erode(test,np.ones((5,5), np.uint8),iterations=1)
+				test1 = test1*a*self.FRAMEMASK
+				test1 = test1.flatten()
+				test1 = test1[test1>0]
+				#kernels
+				kernel = np.ones((40,40), np.uint8)
+				kernel2 = np.ones((5,5), np.uint8)
+				#expand and fill
+				#test = cv2.erode(test, kernel2, iterations = 1)	
+				test = cv2.morphologyEx(test, cv2.MORPH_CLOSE, kernel)	
+				test = cv2.dilate(test, kernel2, iterations = 2)
+
+				xchange = -5
+				ychange = -5
+				
+				#move frame			
+				#nptemp = test[self.top:self.bottom,self.left:self.right]
+				#test = np.zeros((480,640))
+				#test[self.top+ychange:self.bottom+ychange,self.left+xchange:self.right+xchange] = nptemp
+			
+				#only in frame	
+				self.objectmaskbefore = self.objectmask
+				self.objectmask = np.array([test.astype(int)*self.FRAMEMASK]*3)
+				self.objectmask = np.transpose(self.objectmask, (1,2,0)) 
+				if len(test1):
+					self.dist = np.mean(test1)/20
+				else:
+					self.dist = 0
+			self.depth_now +=1
+			self.color_or_depth = False
+
+
+        
+	def predict(self, img):
+		if not self.color_or_depth:
+			if self.now % self.rate == 0:
+				self.stabilizedepth()
+				if self.app.issavedata:
+					print 'dumping training data..'
+					cPickle.dump(self.combineddata, open(self.resourcespath + "TRAINDATA.pkl", 'wb'))
+					cPickle.dump(self.newolddata, open(self.resourcespath + "NEWOLDDATA.pkl", 'wb'))
+					cPickle.dump(self.classes, open(self.resourcespath + "CLASSES.pkl", 'wb'))
+					print "quit"
+					self.app.issavedata = False
+				#print "color"
+				try:
+					cvimage = self.bridge.imgmsg_to_cv(img, "bgr8")
+				except CvBridgeError, e:
+		  			print e	
+			
+				convertedcvimg = cv2.cvtColor(np.array(cvimage), cv2.COLOR_BGR2RGB)
+				#for GUI
+				isolatedobject = convertedcvimg*self.objectmask
+				bgmask = (self.objectmask == 0).astype(int)
+				randomnoise = np.random.randint(0,255,(480,640,3))
+				bgcolornoise = bgmask*randomnoise
+				isolatedobject += bgcolornoise
+				isolatedobject = isolatedobject.astype(np.uint8)
+				#for gui
+				guiimg = Image.fromarray(isolatedobject)	
+				if np.amax(self.objectmask) == 1.0:
+					#for caffe
+					isolatedobject = isolatedobject[self.top:self.bottom,self.left:self.right]			
+					result = skimage.img_as_float(isolatedobject)
+					self.net.predict([result])
+					features = self.net.blobs['fc7'].data[4]
+					features = np.array(features)
+					features.shape = (4096)
+					numchoice = self.svm.predict(features)[0]
+					#self.svm.predict(features)[0]
+					if numchoice < len(self.classes): 
+						textchoice = self.classes[numchoice]
+						if not self.picstobetaken:
+							os.system("espeak '"+textchoice+"'")
+						#print self.svm.decision_function(features.tolist())
+					else: 
+						textchoice = "nothing"
+					likelihood = 1.0					
+					print self.svm.predict_proba([features])
+					probs = self.svm.predict_proba(features)[0]
+					newold = self.newoldclassifier.predict([max(probs)-(sum(probs)-max(probs))/(len(probs)-1)])[0]
+					if numchoice < len(self.classes):			
+						likelihood = probs[numchoice]	
+					print "new" if newold == True else "old", max(probs)-(sum(probs)-max(probs))/(len(probs)-1)				
+					if self.picstobetaken > 0:
+						self.combineddata.append([features.tolist(), len(self.classes)-1])
+						self.picstobetaken -= 1
+						self.newolddata.append([[max(probs)-(sum(probs)-max(probs))/(len(probs)-1)], 1])
+						if self.picstobetaken == 0:
+							print "\n\n\n\n\n\n ----------------------DONE-----------------\n\n\n\n\n"
+							data = np.random.permutation(self.combineddata)
+							X, Y = zip(*data)
+							self.svm.fit(X,Y)
+						elif self.picstobetaken % 10 == 0:
+							self.movecircle()
+							#print 'circling...'
+				else:
+					textchoice = ""
+					likelihood = 1
+				self.app.updateResults((textchoice, likelihood), guiimg)
+				if self.app.istakepic:
+					self.app.istakepic = False
+					text = "What is this class?: \n"
+					for i in range(len(self.classes)):
+						text += str(i) + " => " + self.classes[i] + " \n"
+					text += "-1 => new class \n\n"
+					text += "-3 => cancel \n\n"
+					correctclass = int(input(text))
+					if correctclass != -3:				
+						classindex, new = self.checkClass(correctclass)
+						if new:
+							newclassname = raw_input("What would you like to name this new class?: ")							
+							print 'pictures to be taken: %d ' % self.picstobetaken
+							self.classes.append(newclassname)
+							self.newolddata.append([[max(probs)-(sum(probs)-max(probs))/(len(probs)-1)], 1])
+							x, y = zip(*self.newolddata)
+							self.newoldclassifier.fit(x,y)
+							self.picstobetaken = 25
+						else: 	
+							if correctclass < -9:
+								correctClass = abs(correctclass+10)					
+								self.newolddata.append([[max(probs)-(sum(probs)-max(probs))/(len(probs)-1)], 0])
+								x, y = zip(*self.newolddata)
+								print len(x), len(y)
+								print "\n\nx\n\n", x, "\n\ny\n\n", y
+								self.newoldclassifier.fit(x,y)
+							
+							self.combineddata.append([features.tolist(), correctclass])
+							data = np.random.permutation(self.combineddata).tolist()
+							X, Y = zip(*data)
+							print len(X), len(Y)
+							print X[0],Y[0]
+							self.svm.fit(X,Y)
+			self.now += 1
+			self.color_or_depth = True
+			#del self.sub
+			#self.sub = rospy.Subscriber("depth/points", PointCloud2, self.processpoints)
+	def checkClass(self, corrclass):
+		if corrclass == -1:
+			return len(self.classes), True
+		else:
+			return corrclass, False
+	def isnew(results):
+		isitnew = isnewresults(results)
+		return True if isitnew[0] >= isitnew[1] else False
+	def isnewresults(results):
+		return self.isnew.activate(results)
+	def movecircle(self):
+		self.takingpics = True
+		print 'moving and taking pictures'
+
+		self.twist.angular.z=-1; self.twist.linear.x = 0
+		time = 0
+		while time < 3.3:
+			self.pub.publish(self.twist)
+			time  += 0.1
+			self.r.sleep()
+		print self.dist
+		self.twist.linear.x = self.dist*0.00348;self.twist.angular.z=0.35
+		time = 0
+		while time < 4:
+			self.pub.publish(self.twist)
+			time  += 0.1
+			self.r.sleep()
+		time = 0
+		self.twist.linear.x = 0;self.twist.angular.z=1
+		while time < 3.2:
+			self.pub.publish(self.twist)
+			time  += 0.1
+			self.r.sleep()
+		self.twist.linear.x = 0;self.twist.angular.z=-0
+		self.pub.publish(self.twist)
+	def stabilizedepth(self):
+		maxspeed = 0.2
+		center = len(self.objectmask)/2
+		onesy, onesx, onesz = np.where(self.objectmask == 1)
+		objectcenter = np.sum(onesx)/onesx.shape[0]-60
+		#if abs(self.dist - 35) 
+		if self.dist > 38 or self.dist == 0:
+			self.stoptime = 0
+			smoothertime = .3
+			upspeed = maxspeed
+			x = (self.time - smoothertime)
+			speed = upspeed - upspeed/(1+math.e**(-(4*smoothertime*x)+2*smoothertime))
+			if speed < self.currspeed:
+				speed = self.currspeed
+			self.time +=0.1	
+			self.twist.linear.x = speed; self.twist.angular.z = 0
+			self.currspeed = speed
+			self.pub.publish(self.twist)
+			self.r.sleep()
+		elif self.dist < 32:
+			self.stoptime = 0
+			smoothertime = .3
+			upspeed = -maxspeed
+			x = (self.time - smoothertime)
+			#currupspeeddiff = self.currspeed - upspeed
+			speed = upspeed - upspeed/(1+math.e**(-(4*smoothertime*x)+2*smoothertime))
+			self.time +=0.1	
+			self.twist.linear.x = speed; self.twist.angular.z = 0
+			self.currspeed = speed
+			self.pub.publish(self.twist)
+		elif self.currspeed != 0:
+			self.time = 0
+			smoothertime = .3
+			upspeed = self.currspeed
+			x = (self.stoptime - smoothertime)
+			speed = upspeed/(1+math.e**(-(4*smoothertime*x)+2*smoothertime))
+			if speed < 0.01:
+				speed = 0
+				self.currspeed = 0
+			self.stoptime += 0.1
+			self.twist.linear.x = speed; self.twist.angular.z = 0
+			self.pub.publish(self.twist)
+		elif abs(objectcenter - center) > 2:
+			smoothertime = .3
+			if center - objectcenter > 0:
+				sign = 1
+			else:
+				sign = -1
+			upspeed = sign*maxspeed*2
+			speed = upspeed
+			self.time += 0.1
+			self.twist.angular.z = speed
+			self.pub.publish(self.twist)
+		else:
+			speed = 0
+			self.time = 0
+			self.twist.angular.z = speed
+			self.pub.publish(self.twist)
+	def centerobject(self):
+		center = (len(self.objectmask), len(self.objectmask[0]))
+		change = (shape[0], shape[1], preferreddist-shape[2])
+		self.pub.publish(twist)
+
+if __name__ == "__main__":
+	
+	root = Tk()
+	app = App(root)
+	node = Recognizer(app)
+

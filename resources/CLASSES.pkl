@@ -1,0 +1,14 @@
+(lp1
+S'cat'
+p2
+aS'eight ball'
+p3
+aS'bottle'
+p4
+aS'cube'
+p5
+aS'book end'
+p6
+aS'tea'
+p7
+a.

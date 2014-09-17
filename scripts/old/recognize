@@ -1,0 +1,225 @@
+#!/usr/bin/env python
+
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#    * Redistributions of source code must retain the above copyright
+#      notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above copyright
+#      notice, this list of conditions and the following disclaimer in the
+#      documentation and/or other materials provided with the distribution.
+#    * Neither the name of the Willow Garage, Inc. nor the names of its
+#      contributors may be used to endorse or promote products derived from
+#       this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+import roslib
+roslib.load_manifest('sensor_msgs')
+import rospy
+import caffe
+import numpy as np
+import cv2
+import sys
+from App import App
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import PointCloud2
+import sensor_msgs
+from sensor_msgs.msg import Image as Imgmsg
+from cv_bridge import CvBridge, CvBridgeError
+from sklearn import linear_model, cluster, svm
+import skimage.io
+import cPickle
+from Tkinter import *
+from PIL import Image, ImageTk
+
+import select, termios, tty, ImageFile, os.path, time
+
+class Recognize:
+	def __init__(self, app):
+		self.app = app
+		self.rate = 5
+		self.curr = 0
+
+		self.points = []
+		#change directory to caffe
+        	caffe_root = '../'
+		self.resourcespath = os.environ['HOME']+"/workspace/src/recognize/resources/"
+		#example dir
+		caffe_dir = os.environ['HOME']+"/caffe/examples"
+		os.chdir(caffe_dir)
+		
+		#classes
+		self.classes = ["cat", "eight ball", "bottle", "cube"]
+	
+		#setup classifier
+		MODEL_FILE = 'imagenet/imagenet_deploy.prototxt'
+        	PRETRAINED = 'imagenet/caffe_reference_imagenet_model'
+		self.net = caffe.Classifier(MODEL_FILE, PRETRAINED, mean_file=caffe_root + 'python/caffe/imagenet/ilsvrc_2012_mean.npy', channel_swap=(2,1,0), input_scale=255)
+		
+        	self.net.set_phase_test()
+        	self.net.set_mode_gpu()
+		
+		self.train()
+
+		#setup classifier
+		
+		#logistic regression
+		#self.lr = linear_model.LogisticRegression(C=1.0, penalty='l1', tol=1e-6)
+        	#svm
+		self.svm = svm.SVC(probability=True)
+		#kmeans
+		#self.kmeans = cluster.KMeans(n_clusters=4)
+		
+		X = []
+		y = []
+		
+		self.alldata = cPickle.load(open(self.resourcespath + "DATA.pkl", 'rb'))
+		combineddata = []
+		for noun in self.alldata:
+			combineddata += noun
+		X,y = zip(*combineddata)
+				
+		#self.lr.fit(X,y)		
+		self.svm.fit(X,y)
+		#self.kmeans.fit(X,y)
+
+		#print "\n\n\n----------TESTING--------\n\n\n"
+		#test()
+		self.lastSeen = 0
+		self.bridge = CvBridge()		
+		self.answernum = [0, 0]
+		rospy.init_node('turtlebot_image')
+        	#pub = rospy.Publisher('~cmd_vel', Twist)
+        	sub1 = rospy.Subscriber("depth/points", PointCloud2, self.getPoints)
+        	sub2 = rospy.Subscriber("camera/rgb/image_color", Imgmsg, self.getPoints)
+		#rospy.Rate(4)
+		root.mainloop()
+        	rospy.spin()
+		
+	def predict(self, img):
+		if self.curr % self.rate == 0:
+			if self.app.isquit():
+				sys.exit()
+			try:
+				cvimage = self.bridge.imgmsg_to_cv(img, "bgr8")
+			except CvBridgeError, e:
+		  		print e	
+			cvtcvimg = cv2.cvtColor(np.array(cvimage), cv2.COLOR_BGR2RGB)
+			#for GUI
+			convertedimg = Image.fromarray(cvtcvimg)
+			#for caffe
+			result = skimage.img_as_float(cvtcvimg)        
+			self.net.predict([result])
+			features = self.net.blobs['fc7'].data[4]
+			X = np.array(features)
+			X.shape = (4096)
+			predictionnum = self.svm.predict(X)[0]
+			prediction = self.classes[predictionnum]
+			likelihood = self.svm.predict_proba(X)[0][predictionnum]
+			if self.answernum[1] > 2 and self.answernum[0] == predictionnum:		
+				self.app.updateResults((prediction, likelihood), convertedimg)
+			if self.answernum[0] == predictionnum:
+				self.answernum[1] += 1
+			else:
+				self.answernum[0] = predictionnum
+				self.answernum[1] = 1
+		self.curr += 1
+
+	def getPoints(self, points):
+		#print dir(points)
+		#print type(points.data)
+		if self.lastSeen != type(points):
+			if type(points) == Imgmsg:
+				self.predict(points)
+			else:
+				pointsarr = np.fromstring(points.data, dtype=np.uint8)
+			self.lastSeen = type(points)
+				
+		#print sum(pointsarr)/len(pointsarr)
+		#for x in points.data:
+			#print x		
+		#print str(sum(points.data))		
+		#if sum(points.data)/len(points.data) > 1:
+		#	print "too far"
+
+	def train(self):
+		#run images through caffe
+		if not os.path.isfile(self.resourcespath + "DATA.pkl"):
+			print "\n\n\n-----------------Serializing Images------------\n\n\n"	
+			n = 10
+			alldata = []
+			
+			#just to make sure it's working
+			cntr = 0
+			for folder in os.listdir(self.resourcespath + "data"):
+				for img in os.listdir(self.resourcespath+"data/"+folder):
+					cntr += 1
+	
+			#pickling through images 
+			for folder in os.listdir(self.resourcespath + "data"):
+				classes.append(folder[folder.index(".")+1:])
+				classdata = []
+				
+				for img in os.listdir(self.resourcespath+"data/"+folder):	
+        	                        print "Images left:", cntr
+					cntr -= 1
+					caffeimg = caffe.io.load_image(self.resourcespath+"data/"+folder+"/"+img)
+					self.net.predict([caffeimg])
+					features = self.net.blobs['fc7'].data[4]
+					valuefeatures = []
+					for feature in features:
+						valuefeatures.append(float(feature))
+					classdata.append((np.array(valuefeatures), int(folder[0])))
+				alldata.append(classdata)
+			cPickle.dump(alldata, open(self.resourcespath + "DATA.pkl", 'wb'))
+	
+	def test(self):
+		totalscntr = [0] * len(self.classes)
+		correctcntr = [0] * len(self.classes)
+		#split each class' data into n parts
+		n = 10
+		for i in range(n):
+			piccntr = 0
+			testset = [[],[]]
+			trainset = [[],[]]
+        	        for noun in self.alldata:
+        	        	partlen = int(len(noun)/n)
+				testing = zip(*[noun[j] for j in range(i*partlen, (i+1)*partlen)])
+				training = zip(*[k for k in noun if k not in testset])
+				testset[0] += testing[0]
+				testset[1] += testing[1]
+				trainset[0] += training[0]
+				trainset[1] += training[1]
+			self.lr.fit(trainset[0], trainset[1])
+			testsetX = np.array(testset[0])
+			testsetX.shape = (len(testset[0]), 4096)
+			outputvector = self.lr.predict(testsetX)
+			for y in range(len(outputvector)):
+				totalscntr[testset[1][y]] += 1
+				print outputvector[y], " == ", testset[1][y]
+				if outputvector[y] == testset[1][y]:
+					correctcntr[testset[1][y]] += 1
+		print str(correctcntr), str(totalscntr), str(sum(correctcntr)), str(sum(totalscntr))
+		for i in range(len(totalscntr)):
+			print "\n" + str(classes[i]) + ": Accuracy rate: " + str(correctcntr[i]/totalscntr[i]*100)+"%"
+		sumcorrect = sum(correctcntr)
+		sumtotals = sum(totalscntr)
+		print  "\n\n" + "TOTAL: Accuracy rate: " + str((sumcorrect/sumtotals)*100)+"%"
+	
+if __name__ == "__main__":
+	root = Tk()
+	app = App(root)
+	node = Recognize(app)
+

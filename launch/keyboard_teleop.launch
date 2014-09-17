@@ -1,0 +1,20 @@
+<launch>
+  <!-- turtlebot_teleop_key already has its own built in velocity smoother -->
+  <param name="camera/rgb/image_color/compressed/jpeg_quality" value="22"/>
+  
+  <include file="$(find turtlebot_bringup)/launch/3dsensor.launch">
+    <arg name="rgb_processing" value="true"/> <!-- only required if we use android client -->
+    <arg name="depth_processing" value="true"/>
+    <arg name="depth_registered_processing" value="false"/>
+    <arg name="depth_registration" value="false"/>
+    <arg name="disparity_processing" value="false"/>
+    <arg name="disparity_registered_processing" value="false"/>
+    <arg name="scan_processing" value="false"/>
+  </include>
+  <node pkg="recognize" type="recognize" name="turtlebot_teleop_keyboard"  output="screen">
+    <param name="scale_linear" value="0.5" type="double"/>
+    <param name="scale_angular" value="1.5" type="double"/>
+    <remap from="turtlebot_teleop_keyboard/cmd_vel" to="cmd_vel_mux/input/teleop"/>
+    <remap from="depth/points" to="camera/depth/points"/>
+  </node>
+</launch>
